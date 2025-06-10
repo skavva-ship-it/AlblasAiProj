@@ -362,7 +362,7 @@ class ViewController: UIViewController, ARSCNViewDelegate {
     func sendImageToGemini(image: UIImage) {
         guard let imgdata = image.jpegData(compressionQuality: 0.8)?.base64EncodedString() else { return }
         
-        let key = "AIzaSyDVyMzCFHc5rilhhvn9bSsfFYsvOKxF5i8"
+        let key = "REDACTED"
         let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=\(key)")!
 
         var request = URLRequest(url: url)

@@ -1,0 +1,454 @@
+// Updated to fix conflict between drawing gesture and rotation gesture by adding a toggleable rotation mode button
+import UIKit
+import SceneKit
+import ARKit
+
+class ViewController: UIViewController, ARSCNViewDelegate {
+    
+    var scene_view: ARSCNView!
+    var selectedPlaneNode: SCNNode?
+    var activeHandle: SCNNode?
+    var drawingImage: UIImage?
+    var lastTouchPoint: CGPoint?
+    var isRotationModeEnabled: Bool = false
+    var rotateButton: UIButton?
+    var isDimensionModeEnabled: Bool = false
+    var dimensionButton: UIButton?
+
+
+    
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        
+        scene_view = ARSCNView(frame: view.bounds)
+        scene_view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(scene_view)
+        
+        scene_view.delegate = self
+        scene_view.scene = SCNScene()
+        scene_view.autoenablesDefaultLighting = true
+        
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.alignment = .trailing
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        
+        func makeButton(title: String, selector: Selector) -> UIButton {
+            let btn = UIButton(type: .system)
+            btn.setTitle(title, for: .normal)
+            btn.setTitleColor(.white, for: .normal)
+            btn.backgroundColor = .black
+            btn.layer.cornerRadius = 6
+            btn.titleLabel?.font = .boldSystemFont(ofSize: 14)
+            btn.widthAnchor.constraint(equalToConstant: 50).isActive = true
+            btn.heightAnchor.constraint(equalToConstant: 32).isActive = true
+            btn.addTarget(self, action: selector, for: .touchUpInside)
+            return btn
+        }
+        
+        let rotateToggle = makeButton(title: "↺", selector: #selector(toggleRotationMode))
+        rotateButton = rotateToggle
+        
+        let dimToggle = makeButton(title: "⇲", selector: #selector(toggleDimensionMode))
+        dimensionButton = dimToggle
+
+        
+        [makeButton(title: "+", selector: #selector(addFallbackPlane)),
+         makeButton(title: "×", selector: #selector(deleteAllPlanes)),
+         makeButton(title: "AI", selector: #selector(interpretDrawing)),
+         makeButton(title: "CLR", selector: #selector(clearDrawing)),
+         rotateToggle,
+         dimToggle].forEach {
+            stack.addArrangedSubview($0)
+        }
+
+
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
+        ])
+        
+        let panGesture = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        scene_view.addGestureRecognizer(panGesture)
+        
+        scene_view.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(handleTripleTap(_:))))
+        scene_view.addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:))))
+    }
+    
+    @objc func handleDimensionPan(_ gesture: UIPanGestureRecognizer) {
+        let loc = gesture.location(in: scene_view)
+        guard let parent = selectedPlaneNode,
+              let planeNode = parent.childNode(withName: "plane", recursively: false),
+              let plane = planeNode.geometry as? SCNPlane else { return }
+
+        switch gesture.state {
+        case .began:
+            let hits = scene_view.hitTest(loc, options: [SCNHitTestOption.categoryBitMask: 2])
+            for r in hits where r.node.name?.contains("Edge") == true {
+                activeHandle = r.node
+                return
+            }
+        case .changed:
+            guard let handle = activeHandle else { return }
+            if let hit = scene_view.hitTest(loc, types: [.existingPlaneUsingExtent, .featurePoint]).first {
+                let pos = hit.worldTransform.columns.3
+                let local = planeNode.convertPosition(SCNVector3(pos.x, pos.y, pos.z), from: nil)
+
+                if handle.name?.contains("top") == true || handle.name?.contains("bottom") == true {
+                    plane.height = max(0.1, CGFloat(abs(local.y)) * 2)
+                }
+                if handle.name?.contains("left") == true || handle.name?.contains("right") == true {
+                    plane.width = max(0.1, CGFloat(abs(local.x)) * 2)
+                }
+
+                let w = Float(plane.width / 2)
+                let h = Float(plane.height / 2)
+                let z: Float = 0.01
+                planeNode.childNode(withName: "topEdge", recursively: false)?.position = SCNVector3(0, h, z)
+                planeNode.childNode(withName: "bottomEdge", recursively: false)?.position = SCNVector3(0, -h, z)
+                planeNode.childNode(withName: "leftEdge", recursively: false)?.position = SCNVector3(-w, 0, z)
+                planeNode.childNode(withName: "rightEdge", recursively: false)?.position = SCNVector3(w, 0, z)
+            }
+        case .ended, .cancelled:
+            activeHandle = nil
+        default: break
+        }
+    }
+
+    
+    @objc func toggleRotationMode() {
+        isRotationModeEnabled.toggle()
+        rotateButton?.backgroundColor = isRotationModeEnabled ? .white : .black
+        rotateButton?.setTitleColor(isRotationModeEnabled ? .black : .white, for: .normal)
+    }
+    
+    @objc func handlePan(_ gesture: UIPanGestureRecognizer) {
+        if isRotationModeEnabled {
+            handlePlaneRotationPan(gesture)
+        } else if isDimensionModeEnabled {
+            handleDimensionPan(gesture)
+        } else {
+            handleDrawing(gesture)
+        }
+    }
+    
+    @objc func toggleDimensionMode() {
+        isDimensionModeEnabled.toggle()
+        if isDimensionModeEnabled {
+            isRotationModeEnabled = false
+            rotateButton?.backgroundColor = .black
+            rotateButton?.setTitleColor(.white, for: .normal)
+        }
+        dimensionButton?.backgroundColor = isDimensionModeEnabled ? .white : .black
+        dimensionButton?.setTitleColor(isDimensionModeEnabled ? .black : .white, for: .normal)
+    }
+
+    @objc func interpretDrawing() {
+        guard let img = drawingImage else { return }
+        sendImageToGemini(image: img)
+    }
+    
+    func sendImageToGemini(image: UIImage) {
+        guard let imageData = image.jpegData(compressionQuality: 0.8)?.base64EncodedString() else { return }
+        
+        let apiKey = "AIzaSyDVyMzCFHc5rilhhvn9bSsfFYsvOKxF5i8"
+        let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=\(apiKey)")!
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let payload: [String: Any] = [
+            "contents": [
+                [
+                    "parts": [
+                        ["text": "Describe this sketch."],
+                        ["inlineData": [
+                            "mimeType": "image/jpeg",
+                            "data": imageData
+                        ]]
+                    ]
+                ]
+            ]
+        ]
+
+        
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        
+        URLSession.shared.dataTask(with: request) { data, _, error in
+            if let error = error {
+                print("Error:", error)
+                return
+            }
+
+            // Safely unwrap data first
+            guard let data = data else {
+                print("❌ No data received from Gemini")
+                return
+            }
+
+            // Optional: print raw JSON response from Gemini
+            print("📦 Raw response:\n", String(data: data, encoding: .utf8) ?? "Unable to decode response")
+
+            // Now try to decode it
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let candidates = json["candidates"] as? [[String: Any]],
+                  let content = candidates.first?["content"] as? [String: Any],
+                  let parts = content["parts"] as? [[String: Any]],
+                  let text = parts.first?["text"] as? String else {
+                print("❌ Unexpected JSON structure")
+                return
+            }
+
+            DispatchQueue.main.async {
+                let alert = UIAlertController(title: "AI Interpretation", message: text, preferredStyle: .alert)
+                alert.addAction(UIAlertAction(title: "OK", style: .default))
+                self.present(alert, animated: true)
+            }
+        }.resume()
+
+    }
+    
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        let config = ARWorldTrackingConfiguration()
+        config.planeDetection = [.horizontal, .vertical]
+        scene_view.session.run(config)
+    }
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        scene_view.session.pause()
+    }
+    
+    func spawnCustomPlane(name: String, at position: SCNVector3, eulerAngles: SCNVector3 = SCNVector3Zero) -> SCNNode {
+        let plane = SCNPlane(width: 0.4, height: 0.4)
+        plane.cornerRadius = 0.05
+        let mat = SCNMaterial()
+        drawingImage = blankDrawingImage()
+        mat.diffuse.contents = drawingImage
+        mat.isDoubleSided = true
+        plane.materials = [mat]
+        
+        let planeNode = SCNNode(geometry: plane)
+        planeNode.name = "plane"
+        
+        let parentNode = SCNNode()
+        parentNode.name = name
+        parentNode.position = position
+        parentNode.eulerAngles = eulerAngles
+        parentNode.addChildNode(planeNode)
+        
+        let handleRadius: CGFloat = 0.015
+        let zOffset: Float = 0.01
+        let edges: [(String, SCNVector3)] = [
+            ("topEdge", SCNVector3(0, Float(plane.height / 2), zOffset)),
+            ("bottomEdge", SCNVector3(0, -Float(plane.height / 2), zOffset)),
+            ("leftEdge", SCNVector3(-Float(plane.width / 2), 0, zOffset)),
+            ("rightEdge", SCNVector3(Float(plane.width / 2), 0, zOffset))
+        ]
+        
+        for (name, pos) in edges {
+            let h = SCNNode(geometry: SCNSphere(radius: handleRadius))
+            h.name = name
+            h.position = pos
+            h.categoryBitMask = 2
+            h.geometry?.firstMaterial?.diffuse.contents = UIColor.black
+            h.geometry?.firstMaterial?.lightingModel = .constant
+            planeNode.addChildNode(h)
+        }
+        
+        scene_view.scene.rootNode.addChildNode(parentNode)
+        return parentNode
+    }
+    
+    func blankDrawingImage(size: CGSize = CGSize(width: 512, height: 512)) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { ctx in
+            UIColor.white.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+        }
+    }
+    
+    func drawSmoothLine(on image: UIImage, from: CGPoint, to: CGPoint, control: CGPoint) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: image.size)
+        return renderer.image { ctx in
+            image.draw(at: .zero)
+            ctx.cgContext.setLineWidth(2)
+            ctx.cgContext.setStrokeColor(UIColor.black.cgColor)
+            ctx.cgContext.setLineCap(.round)
+            ctx.cgContext.setLineJoin(.round)
+
+            let path = UIBezierPath()
+            path.move(to: from)
+            path.addQuadCurve(to: to, controlPoint: control)
+            path.stroke()
+        }
+    }
+    
+    func midPoint(p1: CGPoint, p2: CGPoint) -> CGPoint {
+        return CGPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
+    }
+
+    
+    @objc func addFallbackPlane() {
+        guard selectedPlaneNode == nil else { return }
+        var position: SCNVector3
+        var rotation: SCNVector3
+        
+        if let hit = scene_view.hitTest(scene_view.center, types: [.existingPlaneUsingExtent]).first {
+            let t = hit.worldTransform.columns.3
+            position = SCNVector3(t.x, t.y, t.z)
+            rotation = SCNVector3Zero
+        } else if let frame = scene_view.session.currentFrame {
+            let transform = frame.camera.transform
+            let matrix = SCNMatrix4(transform)
+            let dir = SCNVector3(-matrix.m31, -matrix.m32, -matrix.m33)
+            let origin = SCNVector3(matrix.m41, matrix.m42, matrix.m43)
+            let offset: Float = 0.5
+            position = SCNVector3(origin.x + dir.x * offset, origin.y + dir.y * offset, origin.z + dir.z * offset)
+            rotation = SCNVector3(0, frame.camera.eulerAngles.y + .pi, 0)
+        } else {
+            return
+        }
+        selectedPlaneNode = spawnCustomPlane(name: "surface", at: position, eulerAngles: rotation)
+    }
+    
+    @objc func deleteAllPlanes() {
+        scene_view.scene.rootNode.enumerateChildNodes { node, _ in
+            if node.name == "surface" { node.removeFromParentNode() }
+        }
+        selectedPlaneNode = nil
+    }
+    
+    @objc func clearDrawing() {
+        guard let node = selectedPlaneNode,
+              let plane = node.childNode(withName: "plane", recursively: false)?.geometry as? SCNPlane else { return }
+        drawingImage = blankDrawingImage()
+        plane.materials.first?.diffuse.contents = drawingImage
+    }
+    
+    @objc func handleDrawing(_ gesture: UIPanGestureRecognizer) {
+        guard let node = selectedPlaneNode,
+              let plane = node.childNode(withName: "plane", recursively: false)?.geometry as? SCNPlane,
+              let img = drawingImage else { return }
+
+        let loc = gesture.location(in: scene_view)
+        let hits = scene_view.hitTest(loc, options: nil)
+        guard let result = hits.first(where: { $0.node.name == "plane" }) else { return }
+
+        let uv = result.textureCoordinates(withMappingChannel: 0)
+        let point = CGPoint(x: CGFloat(uv.x) * img.size.width, y: (1 - CGFloat(uv.y)) * img.size.height)
+
+        switch gesture.state {
+        case .began:
+            lastTouchPoint = point
+        case .changed:
+            guard let last = lastTouchPoint else { return }
+            let mid = midPoint(p1: last, p2: point)
+            drawingImage = drawSmoothLine(on: img, from: last, to: point, control: mid)
+            lastTouchPoint = point
+            plane.materials.first?.diffuse.contents = drawingImage
+        case .ended, .cancelled:
+            lastTouchPoint = nil
+        default: break
+        }
+    }
+
+    func drawLine(on image: UIImage, from: CGPoint, to: CGPoint) -> UIImage {
+        let renderer = UIGraphicsImageRenderer(size: image.size)
+        return renderer.image { ctx in
+            image.draw(at: .zero)
+            ctx.cgContext.setLineWidth(4)
+            ctx.cgContext.setStrokeColor(UIColor.black.cgColor)
+            ctx.cgContext.setLineCap(.round)
+            ctx.cgContext.move(to: from)
+            ctx.cgContext.addLine(to: to)
+            ctx.cgContext.strokePath()
+        }
+    }
+    
+    @objc func handleTripleTap(_ gesture: UITapGestureRecognizer) {
+        guard let node = selectedPlaneNode else { return }
+        node.runAction(.sequence([
+            .group([.fadeOut(duration: 0.5), .scale(to: 0, duration: 0.5)]),
+            .removeFromParentNode()
+        ]))
+        selectedPlaneNode = nil
+    }
+    
+    @objc func handlePlaneRotationPan(_ gesture: UIPanGestureRecognizer) {
+        guard let node = selectedPlaneNode else { return }
+        let translation = gesture.translation(in: scene_view)
+        switch gesture.state {
+        case .began, .changed:
+            let dx = Float(translation.x)
+            let dy = Float(translation.y)
+            node.eulerAngles.y += -dx / 300
+            node.eulerAngles.x += -dy / 300
+            gesture.setTranslation(.zero, in: scene_view)
+        default: break
+        }
+    }
+    
+    @objc func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
+        let loc = gesture.location(in: scene_view)
+        guard let parent = selectedPlaneNode,
+              let planeNode = parent.childNode(withName: "plane", recursively: false),
+              let plane = planeNode.geometry as? SCNPlane else { return }
+        
+        switch gesture.state {
+        case .began:
+            let hits = scene_view.hitTest(loc, options: [SCNHitTestOption.categoryBitMask: 2])
+            for r in hits where r.node.name?.contains("Edge") == true {
+                activeHandle = r.node
+                return
+            }
+        case .changed:
+            guard let handle = activeHandle else { return }
+            if let hit = scene_view.hitTest(loc, types: [.existingPlaneUsingExtent, .featurePoint]).first {
+                let pos = hit.worldTransform.columns.3
+                let local = planeNode.convertPosition(SCNVector3(pos.x, pos.y, pos.z), from: nil)
+                
+                if handle.name?.contains("top") == true || handle.name?.contains("bottom") == true {
+                    plane.height = max(0.1, CGFloat(abs(local.y)) * 2)
+                }
+                if handle.name?.contains("left") == true || handle.name?.contains("right") == true {
+                    plane.width = max(0.1, CGFloat(abs(local.x)) * 2)
+                }
+                
+                let w = Float(plane.width / 2)
+                let h = Float(plane.height / 2)
+                let z: Float = 0.01
+                planeNode.childNode(withName: "topEdge", recursively: false)?.position = SCNVector3(0, h, z)
+                planeNode.childNode(withName: "bottomEdge", recursively: false)?.position = SCNVector3(0, -h, z)
+                planeNode.childNode(withName: "leftEdge", recursively: false)?.position = SCNVector3(-w, 0, z)
+                planeNode.childNode(withName: "rightEdge", recursively: false)?.position = SCNVector3(w, 0, z)
+            }
+        case .ended, .cancelled:
+            activeHandle = nil
+        default: break
+        }
+    }
+    
+    func renderer(_ renderer: SCNSceneRenderer, didAdd node: SCNNode, for anchor: ARAnchor) {
+        guard let planeAnchor = anchor as? ARPlaneAnchor else { return }
+        let center = planeAnchor.center
+        let position = SCNVector3(center.x, 0, center.z)
+        let euler = SCNVector3(-Float.pi / 2, 0, 0)
+        let smartNode = spawnCustomPlane(name: "surface", at: position, eulerAngles: euler)
+        node.addChildNode(smartNode)
+    }
+    
+    func renderer(_ renderer: SCNSceneRenderer, didUpdate node: SCNNode, for anchor: ARAnchor) {
+        guard let planeAnchor = anchor as? ARPlaneAnchor else { return }
+        let center = planeAnchor.center
+        for child in node.childNodes {
+            if child.name == "surface" {
+                child.position = SCNVector3(center.x, 0, center.z)
+            }
+        }
+    }
+}
